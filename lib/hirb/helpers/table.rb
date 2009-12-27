@@ -1,6 +1,7 @@
+module Hirb
 # Base Table class from which other table classes inherit.
 # By default, a table is constrained to a default width but this can be adjusted
-# via options as well as Hirb:Helpers::Table.max_width.
+# via the max_width option or Hirb::View.width.
 # Rows can be an array of arrays or an array of hashes.
 #
 # An array of arrays ie [[1,2], [2,3]], would render:
@@ -22,13 +23,42 @@
 #   +-----+--------+
 #
 # By default, the fields/columns are the keys of the first hash.
+#
+# === Custom Callbacks
+# Callback methods can be defined to add your own options that modify rows right before they are rendered.
+# Here's an example that allows for searching with a :query option:
+#   module Query
+#     # Searches fields given a query hash
+#     def query_callback(rows, options)
+#       return rows unless options[:query]
+#       options[:query].map {|field,query|
+#         rows.select {|e| e[field].to_s =~ /#{query}/i }
+#       }.flatten.uniq
+#     end
+#   end
+#   Hirb::Helpers::Table.send :include, Query
+#
+#   >> puts Hirb::Helpers::Table.render [{:name=>'batman'}, {:name=>'robin'}], :query=>{:name=>'rob'}
+#   +-------+
+#   | name  |
+#   +-------+
+#   | robin |
+#   +-------+
+#   1 row in set
+#
+# Callback methods:
+# * must be defined in Helpers::Table and end in '_callback'.
+# * should expect rows and a hash of render options. Rows will be an array of hashes.
+# * are expected to return an array of hashes.
+# * are invoked in alphabetical order.
+# For a thorough example, see {Boson::Pipe}[http://github.com/cldwalker/boson/blob/master/lib/boson/pipe.rb].
 #--
 # derived from http://gist.github.com/72234
-class Hirb::Helpers::Table
-  DEFAULT_MAX_WIDTH = 150
+ class Helpers::Table
+  BORDER_LENGTH = 3 # " | " and "-+-" are the borders
   class TooManyFieldsForWidthError < StandardError; end
+
   class << self
-    attr_accessor :max_width
     
     # Main method which returns a formatted table.
     # ==== Options:
@@ -40,36 +70,80 @@ class Hirb::Helpers::Table
     #                  length.
     # [:max_width] The maximum allowed width of all fields put together. This option is enforced except when the field_lengths option is set.
     #              This doesn't count field borders as part of the total.
+    # [:number]  When set to true, numbers rows by adding a :hirb_number column as the first column. Default is false.
+    # [:change_fields] A hash to change old field names to new field names. This can also be an array of new names but only for array rows.
+    #                  This is useful when wanting to change auto-generated keys to more user-friendly names i.e. for array rows.
+    # [:filters] A hash of fields and the filters that each row in the field must run through. The filter converts the cell's value by applying
+    #            a given proc or an array containing a method and optional arguments to it.
+    # [:vertical] When set to true, renders a vertical table using Hirb::Helpers::VerticalTable. Default is false.
+    # [:all_fields] When set to true, renders fields in all rows. Valid only in rows that are hashes. Default is false.
+    # [:description] When set to true, renders row count description at bottom. Default is true.
+    # [:no_newlines] When set to true, stringifies newlines so they don't disrupt tables. Default is false for vertical tables
+    #                and true for anything else.
     # Examples:
     #    Hirb::Helpers::Table.render [[1,2], [2,3]]
     #    Hirb::Helpers::Table.render [[1,2], [2,3]], :field_lengths=>{0=>10}
+    #    Hirb::Helpers::Table.render [['a',1], ['b',2]], :change_fields=>%w{letters numbers}
     #    Hirb::Helpers::Table.render [{:age=>10, :weight=>100}, {:age=>80, :weight=>500}]
     #    Hirb::Helpers::Table.render [{:age=>10, :weight=>100}, {:age=>80, :weight=>500}], :headers=>{:weight=>"Weight(lbs)"}
+    #    Hirb::Helpers::Table.render [{:age=>10, :weight=>100}, {:age=>80, :weight=>500}], :filters=>{:age=>[:to_f]}
     def render(rows, options={})
-      new(rows,options).render
+      options[:vertical] ? Helpers::VerticalTable.render(rows, options) : new(rows, options).render
+    rescue TooManyFieldsForWidthError
+      $stderr.puts "", "** Error: Too many fields for the current width. Configure your width " +
+        "and/or fields to avoid this error. Defaulting to a vertical table. **"
+      Helpers::VerticalTable.render(rows, options)
     end
   end
   
   #:stopdoc:
   def initialize(rows, options={})
-    @options = options
-    @fields = options[:fields] || ((rows[0].is_a?(Hash)) ? rows[0].keys.sort {|a,b| a.to_s <=> b.to_s} : 
-      rows[0].is_a?(Array) ? (0..rows[0].length - 1).to_a : [])
+    @options = {:description=>true, :filters=>{}, :change_fields=>{}, :no_newlines=>true}.merge(options)
+    @options[:change_fields] = array_to_indices_hash(@options[:change_fields]) if @options[:change_fields].is_a?(Array)
+    @fields = set_fields(rows)
     @rows = setup_rows(rows)
     @headers = @fields.inject({}) {|h,e| h[e] = e.to_s; h}
-    if options.has_key?(:headers)
-      @headers = options[:headers].is_a?(Hash) ? @headers.merge(options[:headers]) : 
-        (options[:headers].is_a?(Array) ? array_to_indices_hash(options[:headers]) : options[:headers])
+    if @options.has_key?(:headers)
+      @headers = @options[:headers].is_a?(Hash) ? @headers.merge(@options[:headers]) :
+        (@options[:headers].is_a?(Array) ? array_to_indices_hash(@options[:headers]) : @options[:headers])
+    end
+    if @options[:number]
+      @headers[:hirb_number] = "number"
+      @fields.unshift :hirb_number
     end
   end
-  
+
+  def set_fields(rows)
+    fields = if @options[:fields]
+      @options[:fields].dup
+    else
+      if rows[0].is_a?(Hash)
+        keys = @options[:all_fields] ? rows.map {|e| e.keys}.flatten.uniq : rows[0].keys
+        keys.sort {|a,b| a.to_s <=> b.to_s}
+      else
+        rows[0].is_a?(Array) ? (0..rows[0].length - 1).to_a : []
+      end
+    end
+    @options[:change_fields].each do |oldf, newf|
+      (index = fields.index(oldf)) ? fields[index] = newf : fields << newf
+    end
+    fields
+  end
+
   def setup_rows(rows)
-    rows ||= []
-    rows = [rows] unless rows.is_a?(Array)
+    rows = Array(rows)
     if rows[0].is_a?(Array)
       rows = rows.inject([]) {|new_rows, row|
         new_rows << array_to_indices_hash(row)
       }
+    end
+    @options[:change_fields].each do |oldf, newf|
+      rows.each {|e| e[newf] = e.delete(oldf) if e.key?(oldf) }
+    end
+    rows = filter_values(rows)
+    rows.each_with_index {|e,i| e[:hirb_number] = (i + 1).to_s} if @options[:number]
+    methods.grep(/_callback$/).sort.each do |meth|
+      rows = send(meth, rows, @options.dup)
     end
     validate_values(rows)
     rows
@@ -79,15 +153,23 @@ class Hirb::Helpers::Table
     body = []
     unless @rows.length == 0
       setup_field_lengths
-      body += @headers ? render_header : [render_border]
+      body += render_header
       body += render_rows
-      body << render_border
+      body += render_footer
     end
-    body << render_table_description
+    body << render_table_description if @options[:description]
     body.join("\n")
   end
-  
+
   def render_header
+    @headers ? render_table_header : [render_border]
+  end
+
+  def render_footer
+    [render_border]
+  end
+
+  def render_table_header
     title_row = '| ' + @fields.map {|f|
       format_cell(@headers[f], @field_lengths[f])
     }.join(' | ') + ' |'
@@ -99,13 +181,13 @@ class Hirb::Helpers::Table
   end
   
   def format_cell(value, cell_width)
-    text = value.length > cell_width ? 
+    text = String.size(value) > cell_width ?
       (
-      (cell_width < 5) ? value.slice(0,cell_width) : value.slice(0, cell_width - 3) + '...'
+      (cell_width < 5) ? String.slice(value, 0, cell_width) : String.slice(value, 0, cell_width - 3) + '...'
       ) : value
-    sprintf("%-#{cell_width}s", text)
+    String.ljust(text, cell_width)
   end
-  
+
   def render_rows
     @rows.map do |row|
       row = '| ' + @fields.map {|f|
@@ -124,45 +206,95 @@ class Hirb::Helpers::Table
     if @options[:field_lengths]
       @field_lengths.merge!(@options[:field_lengths])
     else
-      table_max_width = Hirb::Helpers::Table.max_width || DEFAULT_MAX_WIDTH
-      table_max_width = @options[:max_width] if @options.has_key?(:max_width)
-      restrict_field_lengths(@field_lengths, table_max_width)
+      table_max_width = @options.has_key?(:max_width) ? @options[:max_width] : View.width
+      restrict_field_lengths(@field_lengths, table_max_width) if table_max_width
     end
   end
   
+  def restrict_field_lengths(field_lengths, max_width)
+    max_width -= @fields.size * BORDER_LENGTH + 1
+    original_field_lengths = field_lengths.dup
+    @min_field_length = BORDER_LENGTH
+    adjust_long_fields(field_lengths, max_width)
+  rescue TooManyFieldsForWidthError
+    raise
+  rescue
+    default_restrict_field_lengths(field_lengths, original_field_lengths, max_width)
+  end
+
   # Simple algorithm which given a max width, allows smaller fields to be displayed while
   # restricting longer fields at an average_long_field_length.
-  def restrict_field_lengths(field_lengths, max_width)
+  def adjust_long_fields(field_lengths, max_width)
     total_length = field_lengths.values.inject {|t,n| t += n}
-    if max_width && total_length > max_width
-      min_field_length = 3
-      raise TooManyFieldsForWidthError if @fields.size > max_width.to_f / min_field_length
+    while total_length > max_width
+      raise TooManyFieldsForWidthError if @fields.size > max_width.to_f / @min_field_length
       average_field_length = total_length / @fields.size.to_f
       long_lengths = field_lengths.values.select {|e| e > average_field_length}
-      total_long_field_length = (long_lengths.inject {|t,n| t += n}) * max_width/total_length
-      average_long_field_length = total_long_field_length / long_lengths.size
-      field_lengths.each {|f,length|
-        field_lengths[f] = average_long_field_length if length > average_long_field_length
-      }
+      if long_lengths.empty?
+        raise "Algorithm didn't work, resort to default"
+      else
+        total_long_field_length = (long_lengths.inject {|t,n| t += n}) * max_width/total_length
+        average_long_field_length = total_long_field_length / long_lengths.size
+        field_lengths.each {|f,length|
+          field_lengths[f] = average_long_field_length if length > average_long_field_length
+        }
+      end
+      total_length = field_lengths.values.inject {|t,n| t += n}
+    end
+  end
+
+  # Produces a field_lengths which meets the max_width requirement
+  def default_restrict_field_lengths(field_lengths, original_field_lengths, max_width)
+    original_total_length = original_field_lengths.values.inject {|t,n| t += n}
+    relative_lengths = original_field_lengths.values.map {|v| (v / original_total_length.to_f * max_width).to_i  }
+    # set fields by their relative weight to original length
+    if relative_lengths.all? {|e| e > @min_field_length} && (relative_lengths.inject {|a,e| a += e} <= max_width)
+      original_field_lengths.each {|k,v| field_lengths[k] = (v / original_total_length.to_f * max_width).to_i }
+    else
+      # set all fields the same if nothing else works
+      field_lengths.each {|k,v| field_lengths[k] = max_width / @fields.size}
     end
   end
 
   # find max length for each field; start with the headers
   def default_field_lengths
-    field_lengths = @headers ? @headers.inject({}) {|h,(k,v)| h[k] = v.length; h} : {}
+    field_lengths = @headers ? @headers.inject({}) {|h,(k,v)| h[k] = String.size(v); h} : {}
     @rows.each do |row|
       @fields.each do |field|
-        len = row[field].length
+        len = String.size(row[field])
         field_lengths[field] = len if len > field_lengths[field].to_i
       end
     end
     field_lengths
   end
 
+  def set_filter_defaults(rows)
+    if @options[:_original_class] == Hash && @fields[1] && rows.any? {|e| e[@fields[1]].is_a?(Hash) }
+      (@options[:filters] ||= {})[@fields[1]] ||= :inspect
+    end
+  end
+
+  def filter_values(rows)
+    set_filter_defaults(rows)
+    rows.map {|row|
+      new_row = {}
+      @fields.each {|f|
+        if @options[:filters][f]
+          new_row[f] = @options[:filters][f].is_a?(Proc) ? @options[:filters][f].call(row[f]) :
+            row[f].send(*@options[:filters][f])
+        else
+          new_row[f] = row[f]
+        end
+      }
+      new_row
+    }
+  end
+
   def validate_values(rows)
     rows.each {|row|
       @fields.each {|f|
         row[f] = row[f].to_s || ''
+        row[f].gsub!("\n", '\n') if @options[:no_newlines]
       }
     }
   end
@@ -172,4 +304,5 @@ class Hirb::Helpers::Table
     array.inject({}) {|hash,e|  hash[hash.size] = e; hash }
   end
   #:startdoc:
+end
 end

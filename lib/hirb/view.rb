@@ -1,56 +1,148 @@
 module Hirb
-  # This class contains one method, render_output, which formats and renders the output its given from a console application.
-  # However, this only happens for output classes that are configured to do so or if render_output is explicitly given
-  # a view formatter. The hash with the following keys are valid for Hirb::View.config as well as the :view key mentioned in Hirb:
-  # [:output] This hash is saved to output_config. It maps output classes to hashes that are passed to render_output. Thus these hashes
-  #           take the same options as render_output. In addition it takes the following keys:
-  #           * :ancestor- Boolean which if true allows all subclasses of the configured output class to inherit this config.
-  # 
-  #           Example: {'String'=>{:class=>'Hirb::Helpers::Table', :ancestor=>true, :options=>{:max_width=>180}}}
+  # This class is responsible for managing all view-related functionality. Its functionality is determined by setting up a configuration file
+  # as explained in Hirb and/or passed configuration directly to Hirb.enable. Most of the functionality in this class is dormant until enabled.
   module View
+    DEFAULT_WIDTH = 120
+    DEFAULT_HEIGHT = 40
     class<<self
-      attr_accessor :config, :render_method
+      attr_accessor :render_method
+      attr_reader :config
 
-      # Overrides irb's output method with Hirb::View.render_output. Takes an optional
-      # block which sets the view config.
+      # This activates view functionality i.e. the formatter, pager and size detection. If irb exists, it overrides irb's output
+      # method with Hirb::View.view_output. If using Wirble, you should call this after it. The view configuration
+      # can be specified in a hash via a config file, as options to this method, as this method's block or any combination of these three.
+      # In addition to the config keys mentioned in Hirb, the options also take the following keys:
+      # ==== Options:
+      # * config_file: Name of config file to read.
+      # * output_method: Specify an object's class and instance method (separated by a period) to be realiased with
+      #   hirb's view system. The instance method should take a string to be output. Default is IRB::Irb.output_value
+      #   if using irb.
       # Examples:
-      #   Hirb.enable
-      #   Hirb.enable {|c| c.output = {'String'=>{:class=>'Hirb::Helpers::Table'}} }
-      def enable(&block)
+      #   Hirb::View.enable
+      #   Hirb::View.enable :formatter=>false, :output_method=>"Mini.output"
+      #   Hirb::View.enable {|c| c.output = {'String'=>{:class=>'Hirb::Helpers::Table'}} }
+      def enable(options={}, &block)
         return puts("Already enabled.") if @enabled
         @enabled = true
-        load_config(Hirb::HashStruct.block_to_hash(block))
-        ::IRB::Irb.class_eval do
-          alias :non_hirb_render_output  :output_value
-          def output_value #:nodoc:
-            Hirb::View.render_output(@context.last_value) || non_hirb_render_output
-          end
-        end
+        Hirb.config_file = options.delete(:config_file) if options[:config_file]
+        @output_method = "IRB::Irb.output_value" if Object.const_defined?(:IRB)
+        @output_method = options.delete(:output_method) if options[:output_method]
+        load_config(Util.recursive_hash_merge(options, HashStruct.block_to_hash(block)))
+        resize(config[:width], config[:height])
+        alias_output_method(@output_method) if @output_method
+        true
       end
-      
-      # Disable's Hirb's output by reverting back to irb's.
+
+      # Indicates if Hirb::View is enabled.
+      def enabled?
+        @enabled || false
+      end
+
+      # Disable's Hirb's output and revert's irb's output method if irb exists.
       def disable
         @enabled = false
-        ::IRB::Irb.class_eval do
-          alias :output_value :non_hirb_render_output
-        end
+        unalias_output_method(@output_method) if @output_method
+        false
+      end
+
+      # Toggles pager on or off. The pager only works while Hirb::View is enabled.
+      def toggle_pager
+        config[:pager] = !config[:pager]
+      end
+
+      # Toggles formatter on or off.
+      def toggle_formatter
+        config[:formatter] = !config[:formatter]
+      end
+
+      # Resizes the console width and height for use with the table and pager i.e. after having resized the console window. *nix users
+      # should only have to call this method. Non-*nix users should call this method with explicit width and height. If you don't know
+      # your width and height, in irb play with "a"* width to find width and puts "a\n" * height to find height.
+      def resize(width=nil, height=nil)
+        config[:width], config[:height] = determine_terminal_size(width, height)
+        pager.resize(config[:width], config[:height])
       end
       
-      # This is the main method of this class. This method searches for the first formatter it can apply
-      # to the object in this order: local block, method option, class option. If a formatter is found it applies it to the object
-      # and returns true. Returns false if no formatter found.
-      # ==== Options:
-      # [:method] Specifies a global (Kernel) method to do the formatting.
-      # [:class] Specifies a class to do the formatting, using its render() class method. The render() method's arguments are the output and 
-      #          an options hash.
-      # [:output_method] Specifies a method to call on output before passing it to a formatter.
-      # [:options] Options to pass the formatter method or class.
-      def render_output(output, options={}, &block)
-        if block && block.arity > 0
-          formatted_output = block.call(output)
-          render_method.call(formatted_output)
-          true
-        elsif (formatted_output = format_output(output, options))
+      # This is the main method of this class. When view is enabled, this method searches for a formatter it can use for the output and if
+      # successful renders it using render_method(). The options this method takes are helper config hashes as described in 
+      # Hirb::Formatter.format_output(). Returns true if successful and false if no formatting is done or if not enabled.
+      def view_output(output, options={})
+        enabled? && config[:formatter] && render_output(output, options)
+      rescue Exception=>e
+        index = (obj = e.backtrace.find {|f| f =~ /^\(eval\)/}) ? e.backtrace.index(obj) : e.backtrace.length
+        $stderr.puts "Hirb Error: #{e.message}", e.backtrace.slice(0,index).map {|e| "    " + e }
+        true
+      end
+
+      # Captures STDOUT and renders it using render_method(). The main use case is to conditionally page captured stdout.
+      def capture_and_render(&block)
+        render_method.call Util.capture_stdout(&block)
+      end
+
+      # A lambda or proc which handles the final formatted object.
+      # Although this pages/puts the object by default, it could be set to do other things
+      # i.e. write the formatted object to a file.
+      def render_method
+        @render_method ||= default_render_method
+      end
+
+      # Resets render_method back to its default.
+      def reset_render_method
+        @render_method = default_render_method
+      end
+      
+      # Current console width
+      def width
+        config ? config[:width] : DEFAULT_WIDTH
+      end
+
+      # Current console height
+      def height
+        config ? config[:height] : DEFAULT_HEIGHT
+      end
+
+      # Current formatter config
+      def formatter_config
+        formatter.config
+      end
+
+      # Sets the helper config for the given output class.
+      def format_class(klass, helper_config)
+        formatter.format_class(klass, helper_config)
+      end
+
+      #:stopdoc:
+      def unalias_output_method(output_method)
+        klass, klass_method = output_method.split(".")
+        eval %[
+          ::#{klass}.class_eval do
+            alias_method :#{klass_method}, :non_hirb_view_output
+          end
+        ]
+      end
+
+      def alias_output_method(output_method)
+        klass, klass_method = output_method.split(".")
+        eval %[
+          ::#{klass}.class_eval do
+            alias_method :non_hirb_view_output, :#{klass_method}
+            if '#{klass}' == "IRB::Irb"
+              def #{klass_method} #:nodoc:
+                Hirb::View.view_output(@context.last_value) || Hirb::View.page_output(@context.last_value.inspect, true) ||
+                  non_hirb_view_output
+              end
+            else
+              def #{klass_method}(output_string) #:nodoc:
+                Hirb::View.view_output(output_string) || Hirb::View.page_output(output_string.inspect, true) ||
+                  non_hirb_view_output(output_string)
+              end
+            end
+          end
+        ]
+      end
+
+      def render_output(output, options={})
+        if (formatted_output = formatter.format_output(output, options))
           render_method.call(formatted_output)
           true
         else
@@ -58,138 +150,50 @@ module Hirb
         end
       end
 
-      # A lambda or proc which handles the final formatted object.
-      # Although this puts the object by default, it could be set to do other things
-      # ie write the formatted object to a file.
-      def render_method
-        @render_method ||= default_render_method
+      def determine_terminal_size(width, height)
+        detected  = (width.nil? || height.nil?) ? Util.detect_terminal_size || [] : []
+        [width || detected[0] || DEFAULT_WIDTH , height || detected[1] || DEFAULT_HEIGHT]
       end
 
-      def reset_render_method
-        @render_method = default_render_method
-      end
-
-      # Config hash which maps classes to view hashes. View hashes are the same as the options hash of render_output().
-      def output_config
-        config[:output]
-      end
-
-      def output_config=(value)
-        @config[:output] = value
-      end
-      
-      # Needs to be called for config changes to take effect. Reloads Hirb::Views classes and registers
-      # most recent config changes.
-      def reload_config
-        current_config = self.config.dup.merge(:output=>output_config)
-        load_config(current_config)
-      end
-      
-      # A console version of render_output which takes its same options but allows for some shortcuts.
-      # Examples:
-      #   console_render_output output, :tree, :type=>:directory
-      #   # is the same as:
-      #   render_output output, :class=>"Hirb::Helpers::Tree", :options=> {:type=>:directory}
-      #
-      def console_render_output(*args, &block)
-        load_config unless @config
-        output = args.shift
-        if args[0].is_a?(Symbol) && (view = args.shift)
-          symbol_options = find_view(view)
-        end
-        options = args[-1].is_a?(Hash) ? args[-1] : {}
-        options.merge!(symbol_options) if symbol_options
-        # iterates over format_output options that aren't :options
-        real_options = [:method, :class, :output_method].inject({}) do |h, e|
-          h[e] = options.delete(e) if options[e]; h
-        end
-        render_output(output, real_options.merge(:options=>options), &block)
-      end
-
-      #:stopdoc:
-      def find_view(name)
-        name = name.to_s
-        if (view_method = output_config.values.find {|e| e[:method] == name })
-          {:method=>view_method[:method]}
-        elsif (view_class = Hirb::Helpers.constants.find {|e| e == Util.camelize(name)})
-          {:class=>"Hirb::Helpers::#{view_class}"}
+      def page_output(output, inspect_mode=false)
+        if enabled? && config[:pager] && pager.activated_by?(output, inspect_mode)
+          pager.page(output, inspect_mode)
+          true
         else
-          {}
+          false
         end
       end
 
-      def format_output(output, options={})
-        output_class = determine_output_class(output)
-        options = Util.recursive_hash_merge(output_class_options(output_class), options)
-        output = options[:output_method] ? (output.is_a?(Array) ? output.map {|e| e.send(options[:output_method])} : 
-          output.send(options[:output_method]) ) : output
-        args = [output]
-        args << options[:options] if options[:options] && !options[:options].empty?
-        if options[:method]
-          new_output = send(options[:method],*args)
-        elsif options[:class] && (view_class = Util.any_const_get(options[:class]))
-          new_output = view_class.render(*args)
-        end
-        new_output
+      def pager
+        @pager ||= Pager.new(config[:width], config[:height], :pager_command=>config[:pager_command])
       end
 
-      def determine_output_class(output)
-        if output.is_a?(Array)
-          output[0].class
-        else
-          output.class
-        end
+      def pager=(value); @pager = value; end
+
+      def formatter(reload=false)
+        @formatter = reload || @formatter.nil? ? Formatter.new(config[:output]) : @formatter
       end
+
+      def formatter=(value); @formatter = value; end
 
       def load_config(additional_config={})
-        self.config = Util.recursive_hash_merge default_config, additional_config
+        @config = Util.recursive_hash_merge default_config, additional_config
+        formatter(true)
         true
       end
 
-      # Stores all view config. Current valid keys:
-      #   :output- contains value of output_config
-      def config=(value)
-        reset_cached_output_config
-        @config = value
-      end
-      
-      def reset_cached_output_config
-        @cached_output_config = nil
-      end
-      
-      # Internal view options built from user-defined ones. Options are built by recursively merging options from oldest
-      # ancestors to the most recent ones.
-      def output_class_options(output_class)
-        @cached_output_config ||= {}
-        @cached_output_config[output_class] ||= 
-          begin
-            output_ancestors_with_config = output_class.ancestors.map {|e| e.to_s}.select {|e| output_config.has_key?(e)}
-            @cached_output_config[output_class] = output_ancestors_with_config.reverse.inject({}) {|h, klass|
-              (klass == output_class.to_s || output_config[klass][:ancestor]) ? h.update(output_config[klass]) : h
-            }
-          end
-        @cached_output_config[output_class]
-      end
-      
-      def cached_output_config; @cached_output_config; end
+      def config_loaded?; !!@config; end
 
+      def config
+        @config
+      end
+      
       def default_render_method
-        lambda {|output| puts output}
+        lambda {|output| page_output(output) || puts(output) }
       end
 
       def default_config
-        Hirb::Util.recursive_hash_merge({:output=>default_output_config}, Hirb.config[:view] || {} )
-      end
-
-      def default_output_config
-        Hirb::Views.constants.inject({}) {|h,e|
-          output_class = e.to_s.gsub("_", "::")
-          if (views_class = Hirb::Views.const_get(e)) && views_class.respond_to?(:render)
-            default_options = views_class.respond_to?(:default_options) ? views_class.default_options : {}
-            h[output_class] = default_options.merge({:class=>"Hirb::Views::#{e}"})
-          end
-          h
-        }
+        Util.recursive_hash_merge({:pager=>true, :formatter=>true}, Hirb.config || {})
       end
       #:startdoc:
     end
